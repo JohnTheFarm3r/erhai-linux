@@ -1465,8 +1465,13 @@ static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
 	ret = a6xx_gmu_wait_for_idle(gmu);
 
 	/* If the GMU isn't responding assume it is hung */
-	if (ret)
+	if (ret) {
+		DRM_DEV_ERROR_RATELIMITED(gmu->dev,
+			"GMU not idle before slumber (idle level %d, hw_init %s)\n",
+			gmu->idle_level,
+			adreno_gpu->base.needs_hw_init ? "pending" : "done");
 		goto force_off;
+	}
 
 	adreno_gpu->funcs->bus_halt(adreno_gpu, a6xx_gpu->hung);
 

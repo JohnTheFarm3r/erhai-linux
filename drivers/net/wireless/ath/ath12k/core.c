@@ -103,6 +103,51 @@ static bool ath12k_core_rfkill_is_broken(struct ath12k_base *ab)
 	return false;
 }
 
+/*
+ * The RF front end of these boards cannot use both MACs inside the 5 GHz
+ * band at once. While no vdev is up the firmware scans the lower and the
+ * upper part of the band in parallel, and the MAC on the lower part then
+ * receives nothing, so a scan that also covers the upper part never finds
+ * a BSS on channels 36 to 64. Keep the firmware from using SBS there.
+ */
+static const struct ath12k_core_no_sbs_table {
+	enum ath12k_hw_rev hw_rev;
+	const char *compatible;
+} ath12k_core_no_sbs_table[] = {
+	{ ATH12K_HW_WCN7860_HW20, "oneplus,erhai" },
+	{ /* Sentinel */ }
+};
+
+static void ath12k_core_sbs_config(struct ath12k_base *ab)
+{
+	const struct ath12k_core_no_sbs_table *entry;
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	u32 fw_mode = wmi_ab->fw_mode_config_bits;
+	int ret;
+
+	for (entry = ath12k_core_no_sbs_table; entry->compatible; entry++)
+		if (ab->hw_rev == entry->hw_rev &&
+		    of_machine_is_compatible(entry->compatible))
+			break;
+	if (!entry->compatible)
+		return;
+
+	/* No simultaneous MLO links inside the 5 GHz band either. */
+	wmi_ab->hw_mode_info.support_sbs = false;
+
+	if (!(fw_mode & WMI_FW_MODE_CFG_ASYNC_SBS))
+		return;
+
+	fw_mode &= ~WMI_FW_MODE_CFG_ASYNC_SBS;
+	ret = ath12k_wmi_set_mac_config(ab, wmi_ab->conc_scan_config_bits,
+					fw_mode);
+	if (ret)
+		ath12k_warn(ab, "failed to disable SBS: %d\n", ret);
+	else
+		ath12k_dbg(ab, ATH12K_DBG_BOOT, "SBS disabled, fw mode 0x%08x\n",
+			   fw_mode);
+}
+
 static int ath12k_core_rfkill_config(struct ath12k_base *ab)
 {
 	struct ath12k *ar;
@@ -1005,6 +1050,8 @@ static int ath12k_core_start(struct ath12k_base *ab)
 			goto err_reo_cleanup;
 		}
 	}
+
+	ath12k_core_sbs_config(ab);
 
 	ret = ath12k_dp_tx_htt_h2t_ver_req_msg(ab);
 	if (ret) {

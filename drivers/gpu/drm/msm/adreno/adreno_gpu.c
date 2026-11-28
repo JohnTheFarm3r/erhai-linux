@@ -402,14 +402,30 @@ int adreno_get_param(struct msm_gpu *gpu, struct msm_context *ctx,
 			if (READ_ONCE(gpu->wedged))
 				return -EIO;
 
-			ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
-			if (ret < 0)
+			/*
+			 * Initialize the hardware as a submit does. A GPU that
+			 * is resumed without hw_init does not reach its IFPC
+			 * idle level, and the suspend that follows then spins
+			 * for a second with the GMU lock held, stalling every
+			 * client. GL and Vulkan drivers read the timestamp as
+			 * soon as they open the device.
+			 */
+			ret = mutex_lock_interruptible(&gpu->lock);
+			if (ret)
 				return ret;
 
-			*value = adreno_gpu->funcs->get_timestamp(gpu);
-			pm_runtime_put_autosuspend(&gpu->pdev->dev);
+			ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+			if (ret < 0)
+				goto unlock_timestamp;
 
-			return 0;
+			ret = msm_gpu_hw_init(gpu);
+			if (!ret)
+				*value = adreno_gpu->funcs->get_timestamp(gpu);
+			pm_runtime_put_autosuspend(&gpu->pdev->dev);
+unlock_timestamp:
+			mutex_unlock(&gpu->lock);
+
+			return ret;
 		}
 		return -EINVAL;
 	case MSM_PARAM_PRIORITIES:

@@ -116,6 +116,11 @@ properties:
   '#size-cells':
     const: 0
 
+  '#thermal-sensor-cells':
+    const: 0
+    description:
+      Battery temperature as measured by the battery manager firmware.
+
   regulators:
     type: object
     additionalProperties: false

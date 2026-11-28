@@ -10,6 +10,7 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/unaligned.h>
 
 #include <linux/power/bq27xxx_battery.h>
@@ -153,6 +154,37 @@ static void bq27xxx_battery_i2c_devm_ida_free(void *data)
 	ida_free(&battery_id, num);
 }
 
+/*
+ * A gauge marked oplus,charger-gauge is fitted on some variants of a board
+ * only. Where it is missing nothing acknowledges its address, and a battery
+ * registered for it would never report anything. Only an address that is
+ * never acknowledged counts as missing; any other failure keeps the gauge.
+ */
+#define BQ27XXX_I2C_PROBE_TRIES		5
+#define BQ27XXX_I2C_PROBE_GAP_MS	50
+
+static bool bq27xxx_battery_i2c_missing(struct i2c_client *client)
+{
+	u8 reg = 0, data[2];
+	struct i2c_msg msg[] = {
+		{ .addr = client->addr, .len = sizeof(reg), .buf = &reg },
+		{ .addr = client->addr, .flags = I2C_M_RD, .len = sizeof(data), .buf = data },
+	};
+	int i;
+
+	if (!device_property_read_bool(&client->dev, "oplus,charger-gauge"))
+		return false;
+
+	for (i = 0; i < BQ27XXX_I2C_PROBE_TRIES; i++) {
+		if (i)
+			msleep(BQ27XXX_I2C_PROBE_GAP_MS);
+		if (i2c_transfer(client->adapter, msg, ARRAY_SIZE(msg)) != -ENXIO)
+			return false;
+	}
+
+	return true;
+}
+
 static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 {
 	const struct i2c_device_id *id = i2c_client_get_device_id(client);
@@ -160,6 +192,11 @@ static int bq27xxx_battery_i2c_probe(struct i2c_client *client)
 	int ret;
 	char *name;
 	long num;
+
+	if (bq27xxx_battery_i2c_missing(client)) {
+		dev_info(&client->dev, "gauge not fitted\n");
+		return -ENODEV;
+	}
 
 	/* Get new ID for the new battery device */
 	num = ida_alloc(&battery_id, GFP_KERNEL);

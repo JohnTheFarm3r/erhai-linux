@@ -33,6 +33,8 @@
 #include <linux/input/mt.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -44,6 +46,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 #include <linux/workqueue.h>
 
 #define POGO_KB_SYNC_HEAD		0x55
@@ -116,6 +119,34 @@
 #define POGO_KB_TP_X_MAX		2764
 #define POGO_KB_TP_Y_MAX		1630
 #define POGO_KB_TP_RES			23	/* units per mm */
+
+/*
+ * Touchpad timing.  A report ends with a scan counter (le16), the number of
+ * slots and the button byte.  The counter grows by 120 per scan of the touch
+ * controller, also for scans the keyboard does not forward, and a scan takes
+ * about 8.45 ms.  Reports reach the host in bursts, so each one is placed at
+ * the time of its scan: a run starts at the arrival of a report and goes on
+ * by whole scans times the learnt scan period.  The run's base never lies
+ * after an arrival, creeps forward slowly to follow the smallest transfer
+ * delay, and starts over after a gap or an odd counter step.
+ */
+#define POGO_KB_TP_TRAILER_LEN		4
+#define POGO_KB_TP_SCAN_STEP		120
+#define POGO_KB_TP_SCAN_NS		8450000
+#define POGO_KB_TP_SCAN_LEARN_SHIFT	6
+#define POGO_KB_TP_RUN_SCANS		4
+#define POGO_KB_TP_RUN_GAP_MS		50
+#define POGO_KB_TP_CREEP_PPM		2000
+#define POGO_KB_TP_LAG_MS		30
+
+/*
+ * The touch controller can lose a moving finger for a scan or two and find
+ * it again close by.  A lift followed by a new contact reads as a tap, and
+ * the next touch as tap-and-drag, so a lift is held back for a short time
+ * and dropped if the contact comes back near where it was.
+ */
+#define POGO_KB_TP_LIFT_HOLD_MS		25
+#define POGO_KB_TP_LIFT_DIST		(15 * POGO_KB_TP_RES)
 
 #define POGO_KB_VENDOR			0x22d9
 #define POGO_KB_PRODUCT			0x3869
@@ -211,7 +242,7 @@ static const struct {
 	{ 0x00e9, KEY_VOLUMEUP, KEY_F12 },
 	{ 0x00ea, KEY_VOLUMEDOWN, KEY_F11 },
 	{ 0x01d0, KEY_FN },
-	{ 0x0224, KEY_BACK },
+	{ 0x0224, KEY_ESC, KEY_BACK },	/* printed Esc */
 	{ 0x0244, KEY_APPSELECT },
 	{ 0x02fa, KEY_ASSISTANT },
 	{ 0x038e, KEY_SCREENLOCK, KEY_F6 },
@@ -267,6 +298,21 @@ struct pogo_kb {
 	DECLARE_BITMAP(fn_media, ARRAY_SIZE(pogo_kb_media_keys));
 	bool touching;
 	bool caps_on;
+
+	/* Touchpad timing */
+	bool tp_run;
+	u16 tp_scan;
+	u32 tp_scan_ns;
+	u64 tp_run_ns;
+	ktime_t tp_base;
+	ktime_t tp_rx;
+	ktime_t tp_last_ts;
+	/* Lifts held back, the arrival of each and the last contact positions */
+	unsigned long tp_lifting;
+	ktime_t tp_lift_rx[POGO_KB_TP_SLOTS];
+	u16 tp_x[POGO_KB_TP_SLOTS];
+	u16 tp_y[POGO_KB_TP_SLOTS];
+	struct delayed_work tp_lift_work;
 
 	u8 xfer_cmd;
 	u16 xfer_crc;
@@ -406,17 +452,116 @@ static void pogo_kb_report_media(struct pogo_kb *kb, const u8 *data, u8 len)
 	memcpy(kb->media, usage, sizeof(kb->media));
 }
 
+/* The time of the scan that produced a report with counter @scan. */
+static ktime_t pogo_kb_tp_scan_time(struct pogo_kb *kb, u16 scan, ktime_t now)
+{
+	s64 gap = ktime_to_ns(ktime_sub(now, kb->tp_rx));
+	unsigned int step = (u16)(scan - kb->tp_scan);
+	unsigned int scans = step / POGO_KB_TP_SCAN_STEP;
+	s64 period = kb->tp_scan_ns;
+	ktime_t t;
+
+	if (!kb->tp_run || step % POGO_KB_TP_SCAN_STEP || !scans ||
+	    scans > POGO_KB_TP_RUN_SCANS ||
+	    gap > POGO_KB_TP_RUN_GAP_MS * NSEC_PER_MSEC) {
+		kb->tp_run = true;
+		kb->tp_base = now;
+		kb->tp_run_ns = 0;
+	} else {
+		/* Learn the period from arrivals that match the step */
+		if (2 * gap > scans * period && 2 * gap < 3 * scans * period) {
+			period += (div_s64(gap, scans) - period) >>
+				  POGO_KB_TP_SCAN_LEARN_SHIFT;
+			kb->tp_scan_ns = clamp_t(s64, period,
+						 POGO_KB_TP_SCAN_NS * 3 / 4,
+						 POGO_KB_TP_SCAN_NS * 5 / 4);
+		}
+		kb->tp_run_ns += scans * kb->tp_scan_ns;
+		kb->tp_base = ktime_add_ns(kb->tp_base,
+					   div_s64(gap * POGO_KB_TP_CREEP_PPM, 1000000));
+	}
+	kb->tp_scan = scan;
+	kb->tp_rx = now;
+
+	t = ktime_add_ns(kb->tp_base, kb->tp_run_ns);
+	if (ktime_after(t, now)) {
+		kb->tp_base = ktime_sub_ns(now, kb->tp_run_ns);
+		t = now;
+	}
+	if (ktime_ms_delta(now, t) > POGO_KB_TP_LAG_MS)
+		t = ktime_sub_ms(now, POGO_KB_TP_LAG_MS);
+
+	return t;
+}
+
+static void pogo_kb_tp_update_touching(struct pogo_kb *kb)
+{
+	unsigned int i;
+
+	kb->touching = false;
+	for (i = 0; i < POGO_KB_TP_SLOTS; i++)
+		kb->touching |= input_mt_is_active(&kb->tp->mt->slots[i]);
+}
+
+/* Report the held back lifts in @slots as a frame of their own. */
+static void pogo_kb_tp_end_lifts(struct pogo_kb *kb, unsigned long slots)
+{
+	struct input_dev *input = kb->tp;
+	unsigned int i;
+
+	for_each_set_bit(i, &slots, POGO_KB_TP_SLOTS) {
+		input_mt_slot(input, i);
+		input_mt_report_slot_inactive(input);
+	}
+	kb->tp_lifting &= ~slots;
+
+	input_mt_sync_frame(input);
+	input_set_timestamp(input, kb->tp_last_ts);
+	input_sync(input);
+	pogo_kb_tp_update_touching(kb);
+}
+
+static unsigned long pogo_kb_tp_lifts_due(struct pogo_kb *kb, ktime_t now)
+{
+	unsigned long due = 0;
+	unsigned int i;
+
+	for_each_set_bit(i, &kb->tp_lifting, POGO_KB_TP_SLOTS)
+		if (ktime_ms_delta(now, kb->tp_lift_rx[i]) >= POGO_KB_TP_LIFT_HOLD_MS)
+			__set_bit(i, &due);
+
+	return due;
+}
+
+static void pogo_kb_tp_lift_work(struct work_struct *work)
+{
+	struct pogo_kb *kb = container_of(to_delayed_work(work), struct pogo_kb,
+					  tp_lift_work);
+	unsigned long due;
+
+	spin_lock(&kb->rx_lock);
+	if (kb->tp && kb->tp_lifting) {
+		due = pogo_kb_tp_lifts_due(kb, ktime_get());
+		if (due)
+			pogo_kb_tp_end_lifts(kb, due);
+		if (kb->tp_lifting)
+			mod_delayed_work(system_highpri_wq, &kb->tp_lift_work, 1);
+	}
+	spin_unlock(&kb->rx_lock);
+}
+
 /*
- * data: one five byte slot per contact (id << 4 | down << 1 | flag, x and y
- * as little endian 16 bit values), then the number of slots, then the button
- * byte.  The low bit of the first slot byte is not understood yet and is
- * ignored.
+ * data: one five byte slot per contact (id << 4 | down << 1 | confidence, x
+ * and y as little endian 16 bit values), then the scan counter (le16), the
+ * number of slots and the button byte.
  */
 static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 {
 	struct input_dev *input = kb->tp;
+	ktime_t now = ktime_get();
+	unsigned long end;
 	unsigned int count, i;
-	bool touching = false;
+	ktime_t ts = now;
 
 	if (!input || len < 2)
 		return;
@@ -427,6 +572,38 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		return;
 	}
 
+	if (count * POGO_KB_TP_SLOT_LEN + POGO_KB_TP_TRAILER_LEN <= len)
+		ts = pogo_kb_tp_scan_time(kb, get_unaligned_le16(&data[len - 4]), now);
+
+	/*
+	 * A held back lift is over once its time is up or the contact is back
+	 * too far away; a contact back close by is the same touch.
+	 */
+	end = pogo_kb_tp_lifts_due(kb, now);
+	for (i = 0; i < count; i++) {
+		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
+		unsigned int id = slot[0] >> 4;
+		int dx, dy;
+
+		if (id >= POGO_KB_TP_SLOTS || !(slot[0] & BIT(1)) ||
+		    !test_bit(id, &kb->tp_lifting) || test_bit(id, &end))
+			continue;
+
+		dx = get_unaligned_le16(&slot[1]) - kb->tp_x[id];
+		dy = get_unaligned_le16(&slot[3]) - kb->tp_y[id];
+		if (dx * dx + dy * dy > POGO_KB_TP_LIFT_DIST * POGO_KB_TP_LIFT_DIST)
+			__set_bit(id, &end);
+		else
+			__clear_bit(id, &kb->tp_lifting);
+	}
+	if (end)
+		pogo_kb_tp_end_lifts(kb, end);
+
+	/* Event times never go back */
+	if (ktime_before(ts, kb->tp_last_ts))
+		ts = kb->tp_last_ts;
+	kb->tp_last_ts = ts;
+
 	for (i = 0; i < count; i++) {
 		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
 		unsigned int id = slot[0] >> 4;
@@ -434,6 +611,19 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 
 		if (id >= POGO_KB_TP_SLOTS)
 			continue;
+
+		if (!down && input_mt_is_active(&input->mt->slots[id])) {
+			if (!test_and_set_bit(id, &kb->tp_lifting)) {
+				kb->tp_lift_rx[id] = now;
+				mod_delayed_work(system_highpri_wq, &kb->tp_lift_work,
+						 msecs_to_jiffies(POGO_KB_TP_LIFT_HOLD_MS) + 1);
+			}
+			continue;
+		}
+		if (down) {
+			kb->tp_x[id] = get_unaligned_le16(&slot[1]);
+			kb->tp_y[id] = get_unaligned_le16(&slot[3]);
+		}
 
 		input_mt_slot(input, id);
 		if (input_mt_report_slot_state(input, MT_TOOL_FINGER, down)) {
@@ -444,13 +634,12 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		}
 	}
 
-	for (i = 0; i < POGO_KB_TP_SLOTS; i++)
-		touching |= input_mt_is_active(&input->mt->slots[i]);
-	kb->touching = touching;
+	pogo_kb_tp_update_touching(kb);
 
 	input_mt_sync_frame(input);
 	/* A clickpad: either physical button is the one button */
 	input_report_key(input, BTN_LEFT, data[len - 1] & (BIT(0) | BIT(1)));
+	input_set_timestamp(input, ts);
 	input_sync(input);
 }
 
@@ -468,8 +657,11 @@ static void pogo_kb_release_touches(struct pogo_kb *kb)
 	}
 	input_mt_sync_frame(input);
 	input_report_key(input, BTN_LEFT, 0);
+	kb->tp_last_ts = ktime_get();
+	input_set_timestamp(input, kb->tp_last_ts);
 	input_sync(input);
 	kb->touching = false;
+	kb->tp_lifting = 0;
 }
 
 static void pogo_kb_release_all(struct pogo_kb *kb)
@@ -800,8 +992,10 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	__set_bit(EV_REP, kbd->evbit);
 	for (i = 0; i < ARRAY_SIZE(kb->keymap); i++)
 		__set_bit(kb->keymap[i], kbd->keybit);
-	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++)
+	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++) {
 		__set_bit(pogo_kb_media_keys[i].code, kbd->keybit);
+		__set_bit(pogo_kb_media_keys[i].fn_code, kbd->keybit);
+	}
 	__clear_bit(KEY_RESERVED, kbd->keybit);
 	input_set_capability(kbd, EV_LED, LED_CAPSL);
 
@@ -843,6 +1037,10 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	memset(kb->media, 0, sizeof(kb->media));
 	kb->fn = false;
 	kb->touching = false;
+	kb->tp_run = false;
+	kb->tp_scan_ns = POGO_KB_TP_SCAN_NS;
+	kb->tp_last_ts = 0;
+	kb->tp_lifting = 0;
 	kb->kbd = kbd;
 	kb->tp = tp;
 	spin_unlock(&kb->rx_lock);
@@ -867,7 +1065,9 @@ static void pogo_kb_unregister_inputs(struct pogo_kb *kb)
 	tp = kb->tp;
 	kb->kbd = NULL;
 	kb->tp = NULL;
+	kb->tp_lifting = 0;
 	spin_unlock(&kb->rx_lock);
+	cancel_delayed_work_sync(&kb->tp_lift_work);
 
 	if (tp)
 		input_unregister_device(tp);
@@ -1158,6 +1358,7 @@ static int pogo_kb_probe(struct serdev_device *serdev)
 	init_completion(&kb->echo_done);
 	init_completion(&kb->reply_done);
 	INIT_DELAYED_WORK(&kb->poll_work, pogo_kb_poll_work);
+	INIT_DELAYED_WORK(&kb->tp_lift_work, pogo_kb_tp_lift_work);
 	INIT_WORK(&kb->attach_work, pogo_kb_attach_work);
 	INIT_WORK(&kb->led_work, pogo_kb_led_work);
 
@@ -1224,6 +1425,7 @@ static void pogo_kb_remove(struct serdev_device *serdev)
 
 	disable_irq(kb->irq);
 	disable_delayed_work_sync(&kb->poll_work);
+	disable_delayed_work_sync(&kb->tp_lift_work);
 	disable_work_sync(&kb->attach_work);
 	disable_work_sync(&kb->led_work);
 
@@ -1240,6 +1442,7 @@ static int pogo_kb_suspend(struct device *dev)
 	int ret;
 
 	cancel_delayed_work_sync(&kb->poll_work);
+	cancel_delayed_work_sync(&kb->tp_lift_work);
 	cancel_work_sync(&kb->attach_work);
 	cancel_work_sync(&kb->led_work);
 
