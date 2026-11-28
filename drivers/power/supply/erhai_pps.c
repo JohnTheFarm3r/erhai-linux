@@ -32,6 +32,24 @@
  *
  * The battery manager supplies the freezable worker, policy lock and GLINK
  * transport. There is no independent battery supply or battery_charger client.
+ *
+ * Boards without the pack gauge (oplus,gauge-id 1): the firmware gauges the
+ * pack and its readings steer the pumps, as in the stock system, which reads
+ * the same battery properties while PPS runs. Here that is allowed only by
+ * the battery manager's gaugeless_pps_ma parameter (0, the default, keeps
+ * the pumps out) and stays inside a narrower envelope than with the gauge:
+ * PD PPS only, the stock table for third-party PPS sources
+ * (erhai_pps_envelope.h), the bus current capped by the parameter, the buck's
+ * own charge current left to the firmware, and every poll with an engaged
+ * pump holds the firmware's readings against the pumps' own ADCs, see
+ * pps_gaugeless_check(). A session that fails that check, or has charged
+ * the table through, is not repeated before the charger is replugged; the
+ * firmware then charges from a fixed contract as it does without this, or,
+ * after a session that charged the table through and with the battery
+ * manager's gaugeless_ffc set, the battery manager finishes the charge with
+ * the stock FFC on the buck. For its cross-check the engine lends it the
+ * master pump's battery ADC while the pumps are idle, see
+ * erhai_pps_cell_mv().
  */
 
 #include <linux/platform_device.h>
@@ -47,6 +65,7 @@
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
 #include "erhai_cell_envelope.h"
+#include "erhai_pps_envelope.h"
 
 #define CREATE_TRACE_POINTS
 #include "erhai_pps_trace.h"
@@ -368,7 +387,54 @@ struct erhai_pps {
 	unsigned long		cp_fed_at;	/* last successful feed */
 	bool			inhibit_held;	/* policy inhibit seen this session */
 	unsigned int		cp_rearms;	/* pump attempts this plug */
+
+	/* no pack gauge: the firmware's readings against the pumps' ADCs */
+	bool			gaugeless;
+	unsigned int		gl_cap_ma;	/* bus current ceiling, 0 = off */
+	bool			gl_done;	/* charged through or distrusted: until replug */
+	bool			gl_hot;
+	int			ibat_ua;
+	int			fw_vbat_mv;	/* the firmware's reading alone */
+	int			cp_vbat_mv;
+	unsigned long		cp_vbat_at;
+	int			gl_last_ua;
+	unsigned int		gl_stale;
+	unsigned int		gl_vdiff;
+	unsigned int		gl_idiff;
+	bool			ffc_adc;	/* ADC held for the battery manager's FFC */
 };
+
+/*
+ * Which battery steers the pumps: the pack gauge or, without it, the charger
+ * firmware. False when the firmware would and that is not allowed (now).
+ */
+static bool pps_gaugeless_update(struct erhai_pps *p)
+{
+	int cap = erhai_pps_gaugeless_ma();
+
+	p->gaugeless = cap >= 0;
+	p->gl_cap_ma = cap > 0 ? cap : 0;
+	return cap;
+}
+
+static int pps_cv(struct erhai_pps *p, int temp)
+{
+	return p->gaugeless ? erhai_pps_cv(temp) : erhai_cell_cv(temp);
+}
+
+/* The pack is done by this route: with the gauge the buck supervisor takes
+ * the tail; without it the firmware finishes from a fixed contract, or the
+ * battery manager does with FFC where gaugeless_ffc asks for that.
+ */
+static void pps_tail_complete(struct erhai_pps *p)
+{
+	if (p->gaugeless) {
+		p->gl_done = true;
+		if (!erhai_gaugeless_ffc())
+			return;
+	}
+	erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
+}
 
 static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why);
 
@@ -427,9 +493,15 @@ static int pps_read_battery(struct erhai_pps *p)
 	if (ret)
 		goto out;
 	p->vbat_mv = val.intval / 1000;
+	p->fw_vbat_mv = p->vbat_mv;
+	/* Two measurements of one cell: the higher one runs the table. */
+	if (p->gaugeless && p->cp_vbat_at &&
+	    time_before(jiffies, p->cp_vbat_at + msecs_to_jiffies(2000)))
+		p->vbat_mv = max(p->vbat_mv, p->cp_vbat_mv);
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val);
 	if (ret)
 		goto out;
+	p->ibat_ua = val.intval;
 	p->ibat_ma = val.intval / 1000;
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
 	if (ret)
@@ -468,15 +540,22 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
 	const struct erhai_charge_curve *raw;
+	const struct erhai_charge_curve (*curves)[7] = p->gaugeless ? pps_curves : svooc_curves;
 	unsigned int limit;
 	int last_temp = p->curve_temp;
 	bool new_table;
 
-	raw = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
+	/* Stock entry conditions of the PPS table, see erhai_pps_envelope.h. */
+	if (p->gaugeless && entering &&
+	    (!p->gl_cap_ma || p->soc > ERHAI_PPS_ENTRY_SOC_MAX ||
+	     (p->temp_ddc >= 440 && (p->soc > ERHAI_PPS_WARM_SOC_MAX ||
+				     p->vbat_mv > ERHAI_PPS_WARM_MV_MAX))))
+		return 0;
+	raw = erhai_curve_select(curves, p->soc, p->temp_ddc);
 	p->curve_temp = entering || !p->curve ? p->temp_ddc : erhai_curve_temp(p->curve_temp, p->temp_ddc);
-	curve = erhai_curve_select(svooc_curves, p->soc, p->curve_temp);
+	curve = erhai_curve_select(curves, p->soc, p->curve_temp);
 	if (!raw || !curve || p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
+	    p->vbat_mv >= min(pps_cv(p, p->temp_ddc), pps_cv(p, p->curve_temp)))
 		return 0;
 
 	new_table = entering || !p->curve || p->curve->steps != curve->steps ||
@@ -503,7 +582,53 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	if (raw->steps != curve->steps)
 		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, p->vbat_mv, true)].ma);
 	p->curve_ma = new_table ? limit : min(p->curve_ma, limit);
-	return p->curve_ma;
+	if (!p->gaugeless)
+		return p->curve_ma;
+	if (p->temp_ddc >= ERHAI_PPS_HOT_ON)
+		p->gl_hot = true;
+	else if (p->temp_ddc < ERHAI_PPS_HOT_OFF)
+		p->gl_hot = false;
+	return min3(p->curve_ma, p->gl_cap_ma, p->gl_hot ? ERHAI_PPS_HOT_MA : UINT_MAX);
+}
+
+/*
+ * Without the pack gauge, on every poll with an engaged pump: is the battery
+ * the firmware reports the one the pumps see? -EBADMSG ends fast charging
+ * for this plug.
+ *
+ * - The current reading has to move. The firmware reports microamps and no
+ *   two samples of a live gauge agree for 10 s.
+ * - The cell voltage has to agree with the master pump's battery ADC within
+ *   200 mV (the sense points differ by the drop of the pack connection).
+ * - With the buck suspended everything the pack takes comes through the
+ *   pumps, 2:1: the pack current cannot be above twice the bus current (ADC
+ *   tolerance: a tenth and 500 mA) and cannot be more than the system's
+ *   largest draw (6 A) below it.
+ */
+static int pps_gaugeless_check(struct erhai_pps *p, int cvbat, int cibus)
+{
+	const char *what = NULL;
+	int out = cibus * 2;
+
+	if (!p->gaugeless)
+		return 0;
+	p->gl_stale = p->ibat_ua == p->gl_last_ua ? p->gl_stale + 1 : 0;
+	p->gl_last_ua = p->ibat_ua;
+	p->gl_vdiff = abs(p->fw_vbat_mv - cvbat) > 200 ? p->gl_vdiff + 1 : 0;
+	p->gl_idiff = p->buck_off && (p->ibat_ma > out + out / 10 + 500 ||
+				      p->ibat_ma < out - out / 10 - 6000) ?
+		      p->gl_idiff + 1 : 0;
+	if (p->gl_stale >= 20)
+		what = "current reading does not change";
+	else if (p->gl_vdiff >= 4)
+		what = "cell voltage";
+	else if (p->gl_idiff >= 4)
+		what = "pack current";
+	if (!what)
+		return 0;
+	pr_warn("erhai_pps: firmware battery readings disagree with the pumps (%s): firmware %d mV %d mA, pump vbat %d mV, bus %d mA, buck %s\n",
+		what, p->fw_vbat_mv, p->ibat_ma, cvbat, cibus, p->buck_off ? "off" : "on");
+	return -EBADMSG;
 }
 
 /* A fresh source APDO is checked by the caller. A stale firmware type
@@ -523,6 +648,9 @@ static int pps_buck_fcc(struct erhai_pps *p)
 	u32 want = min(p->fcc_ceiling_ua, p->cell_ma * 2000U);
 	int ret;
 
+	/* Without the pack gauge the buck's charge current is the firmware's. */
+	if (p->gaugeless)
+		return 0;
 	if (want == p->applied_fcc_ua)
 		return 0;
 	p->restore_fcc = true;
@@ -536,6 +664,8 @@ static int pps_save_buck_fcc(struct erhai_pps *p)
 {
 	int saved, ceiling;
 
+	if (p->gaugeless)
+		return 0;
 	saved = erhai_otg_adsp_prop_get(PPS_BATT_OP_GET, PPS_PROP_BATT_CHG_CTRL_LIM);
 	if (saved < 0)
 		return saved;
@@ -789,6 +919,8 @@ static int pps_cp_step(struct erhai_pps *p)
 		return -ERANGE;
 
 	p->pump_ibus_ma = cibus;
+	p->cp_vbat_mv = cvbat;
+	p->cp_vbat_at = jiffies | 1;
 	diff = cvbus - cvbat * 2;
 
 	if (a->cp_engaged()) {
@@ -834,6 +966,9 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (max(cibus, slave_ma) > 4000)
 			target = min_t(unsigned int, target, max(0, cibus + slave_ma - 500));
 		cibus += slave_ma;
+		rc = pps_gaugeless_check(p, cvbat, cibus);
+		if (rc)
+			return rc;
 		/* Count consecutive failed starts, not isolated drops spread
 		 * over a charge. A working converter and measured input end
 		 * the failure episode (stock start success clears retry_count).
@@ -857,7 +992,8 @@ static int pps_cp_step(struct erhai_pps *p)
 		    p->vbus_mv > pps_cp_max_volt_mv || max(p->pump_ibus_ma - slave_ma, slave_ma) >= 4500)
 			nv -= pps_cp_vstep_over_mv;
 		else if (cibus > (int)(target + pps_cp_ibus_band_ma) ||
-			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma, 13600U))
+			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma,
+					       p->gaugeless ? ERHAI_PPS_IBAT_MAX_MA : 13600U))
 			nv -= pps_cp_vstep_mv;
 		else if (cibus < (int)target - (int)pps_cp_ibus_band_ma &&
 			 diff < (int)pps_cp_diff_max_mv)
@@ -978,10 +1114,15 @@ static void pps_poll(struct erhai_pps *p)
 	unsigned int cell_ma = 0;
 	int online, rc;
 
-	if (!READ_ONCE(pps_enable)) {
+	/* A session that is being cleaned up keeps the battery it ran on. */
+	if (p->state == PPS_IDLE && !p->cleanup && !p->adc_held)
+		pps_gaugeless_update(p);
+	if (!READ_ONCE(pps_enable) || !erhai_pps_gaugeless_ma()) {
 		pps_exit(p, "disabled");
 		return;
 	}
+	if (p->gaugeless)
+		p->gl_cap_ma = max(erhai_pps_gaugeless_ma(), 0);
 	if (p->cleanup && p->state == PPS_EXIT) {
 		pps_exit(p, "cleanup retry");
 		return;
@@ -1018,8 +1159,8 @@ static void pps_poll(struct erhai_pps *p)
 		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
 			if (p->temp_ddc >= 0 && p->temp_ddc < 510 &&
-			    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
-				erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
+			    p->vbat_mv >= min(pps_cv(p, p->temp_ddc), pps_cv(p, p->curve_temp)))
+				pps_tail_complete(p);
 			pps_exit(p, "battery limit");
 			return;
 		}
@@ -1029,7 +1170,7 @@ static void pps_poll(struct erhai_pps *p)
 			if (taper != (p->state == PPS_TAPER))
 				pps_enter(p, taper ? PPS_TAPER : PPS_CHARGING, "cell curve");
 		}
-		if (p->ibat_ma > 13600) {
+		if (p->ibat_ma > (p->gaugeless ? ERHAI_PPS_IBAT_MAX_MA : 13600)) {
 			if (!p->ibat_over_since)
 				p->ibat_over_since = jiffies | 1;
 			else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
@@ -1058,7 +1199,7 @@ static void pps_poll(struct erhai_pps *p)
 
 		if (online <= 0)
 			return;
-		if (p->pps_protection || time_before(jiffies, p->retry_at))
+		if (p->pps_protection || p->gl_done || time_before(jiffies, p->retry_at))
 			return;
 
 		if (!pps_deployable(p))
@@ -1094,6 +1235,8 @@ static void pps_poll(struct erhai_pps *p)
 		p->pump_limit_ma = 4000;
 		p->slave_failures = 0;
 		p->ibat_over_since = 0;
+		p->gl_stale = p->gl_vdiff = p->gl_idiff = 0;
+		p->gl_last_ua = INT_MIN;
 		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
 		p->set_curr_ma = min(pps_start_curr_ma, p->target_curr_ma);
 		rc = pps_save_buck_fcc(p);
@@ -1126,8 +1269,12 @@ static void pps_poll(struct erhai_pps *p)
 		rc = pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, p->set_curr_ma);
 		if (rc)
 			goto fail;
+		/* oplus_spec,pd-iclmax-ma: without the pack gauge the buck
+		 * takes its stock 2 A from a PD source.
+		 */
 		rc = pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT,
-				 min(pps_iclim_ma, p->target_curr_ma) * 1000);
+				 min3(pps_iclim_ma, p->target_curr_ma,
+				      p->gaugeless ? 2000U : UINT_MAX) * 1000);
 		if (rc)
 			goto fail;
 
@@ -1246,8 +1393,12 @@ fail:
 		}
 		if (rc) {
 			if (rc == -ENODATA)
-				erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
-			pps_exit(p, rc == -ENODATA ? "cell taper complete" : PPS_EXIT_REASON_SET_FAIL);
+				pps_tail_complete(p);
+			if (rc == -EBADMSG)
+				p->gl_done = true;
+			pps_exit(p, rc == -ENODATA ? "cell taper complete" :
+				 rc == -EBADMSG ? "battery readings disagree with the pumps" :
+				 PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
 		p->charg_ticks++;
@@ -1381,7 +1532,8 @@ static unsigned int erhai_ufcs_update(void *data)
 			pps_exit(p, "UFCS source unavailable");
 		return p->ufcs ? erhai_pps_update(p, false) : 0;
 	}
-	if (p->ufcs_protection)
+	/* Without the pack gauge only PD PPS is driven. */
+	if (p->ufcs_protection || erhai_pps_gaugeless_ma() >= 0)
 		return 0;
 	if (p->state != PPS_IDLE || p->cleanup || !pps_enable || !pps_cp_enable ||
 	    erhai_otg_charge_inhibited() || pps_read_battery(p))
@@ -1432,6 +1584,8 @@ static bool erhai_pps_available(void *data)
 
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
+	if (!pps_gaugeless_update(p) || p->gl_done)
+		return false;
 	if (p->pps_protection || time_before(jiffies, p->retry_at) || !pps_deployable(p))
 		return false;
 	ma = pps_source_limit(&apdo, &grant_known);
@@ -1476,11 +1630,46 @@ static void erhai_pps_recharge(void *data)
 	p->retry_at = jiffies;
 }
 
+/*
+ * The master pump's battery ADC for the battery manager's FFC cross-check
+ * (no pack gauge, pumps idle, see qcom_battmgr_ffc_tick()). The ADC is held
+ * on as for a PPS session; nothing switches. Refused while the engine owns
+ * the pumps: FFC only follows a finished session and must not overlap one.
+ */
+static int erhai_pps_cell_mv(void *data, bool hold)
+{
+	struct erhai_pps *p = data;
+	int vbat, rc;
+
+	if (!hold) {
+		if (p->ffc_adc && p->state == PPS_IDLE && !p->cleanup && !p->adc_held)
+			pps_sc_adc_hold(false);
+		p->ffc_adc = false;
+		return 0;
+	}
+	if (p->state != PPS_IDLE || p->cleanup || pps_sc_delivering() || pps_sc_identifying())
+		return -EBUSY;
+	if (!p->ffc_adc) {
+		rc = pps_sc_adc_hold(true);
+		if (rc)
+			return rc;
+		p->ffc_adc = true;
+	}
+	rc = sc8547a_pps_snapshot(NULL, &vbat, NULL);
+	if (rc)
+		return rc;
+	/* A converter that has not finished its first conversion reads 0. */
+	return vbat > 2500 ? vbat : -ENODATA;
+}
+
 static void erhai_pps_detached(void *data)
 {
 	struct erhai_pps *p = data;
 
+	erhai_pps_cell_mv(p, false);
 	p->pps_protection = p->ufcs_protection = false;
+	p->gl_done = p->gl_hot = false;
+	p->cp_vbat_at = 0;
 	erhai_pps_recharge(p);
 	sc8547a_detached();
 }
@@ -1494,6 +1683,9 @@ static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 	if (serial)
 		return off;
 
+	if (erhai_pps_gaugeless_ma() >= 0)
+		off += sysfs_emit_at(buf, off, "gaugeless_pps_ma=%d gaugeless_done=%d ",
+				     erhai_pps_gaugeless_ma(), p->gl_done);
 	return off + sysfs_emit_at(buf, off, "protocol=%s state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
 			  p->ufcs ? "ufcs" :
 			  p->state == PPS_IDLE ? "none" : "pps",
@@ -1529,6 +1721,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
 	.detached = erhai_pps_detached,
+	.cell_mv = erhai_pps_cell_mv,
 };
 
 static int erhai_pps_probe(struct platform_device *pdev)

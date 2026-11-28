@@ -562,6 +562,7 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 	unsigned long end;
 	unsigned int count, i;
 	ktime_t ts = now;
+	bool scanned;
 
 	if (!input || len < 2)
 		return;
@@ -572,7 +573,8 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 		return;
 	}
 
-	if (count * POGO_KB_TP_SLOT_LEN + POGO_KB_TP_TRAILER_LEN <= len)
+	scanned = count * POGO_KB_TP_SLOT_LEN + POGO_KB_TP_TRAILER_LEN <= len;
+	if (scanned)
 		ts = pogo_kb_tp_scan_time(kb, get_unaligned_le16(&data[len - 4]), now);
 
 	/*
@@ -603,6 +605,11 @@ static void pogo_kb_report_touchpad(struct pogo_kb *kb, const u8 *data, u8 len)
 	if (ktime_before(ts, kb->tp_last_ts))
 		ts = kb->tp_last_ts;
 	kb->tp_last_ts = ts;
+
+	/* Scan time within the run in us, 0 at the start of a run */
+	if (scanned)
+		input_event(input, EV_MSC, MSC_TIMESTAMP,
+			    (u32)div_u64(kb->tp_run_ns, NSEC_PER_USEC));
 
 	for (i = 0; i < count; i++) {
 		const u8 *slot = &data[i * POGO_KB_TP_SLOT_LEN];
@@ -1014,6 +1021,8 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	input_set_abs_params(tp, ABS_MT_POSITION_Y, 0, POGO_KB_TP_Y_MAX, 0, 0);
 	input_abs_set_res(tp, ABS_MT_POSITION_X, POGO_KB_TP_RES);
 	input_abs_set_res(tp, ABS_MT_POSITION_Y, POGO_KB_TP_RES);
+	input_set_abs_params(tp, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX, 0, 0);
+	input_set_capability(tp, EV_MSC, MSC_TIMESTAMP);
 	input_set_capability(tp, EV_KEY, BTN_LEFT);
 	__set_bit(INPUT_PROP_BUTTONPAD, tp->propbit);
 

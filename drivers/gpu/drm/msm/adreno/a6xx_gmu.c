@@ -1466,9 +1466,16 @@ static void a6xx_gmu_shutdown(struct a6xx_gmu *gmu)
 
 	/* If the GMU isn't responding assume it is hung */
 	if (ret) {
+		bool a8xx = adreno_is_a8xx(adreno_gpu);
+
 		DRM_DEV_ERROR_RATELIMITED(gmu->dev,
-			"GMU not idle before slumber (idle level %d, hw_init %s)\n",
+			"GMU not idle before slumber (idle level %d, power state %u, GX %s, pwr_clk_status 0x%x, cx_busy 0x%x, hw_init %s)\n",
 			gmu->idle_level,
+			gmu_read(gmu, a8xx ? REG_A8XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE :
+					     REG_A6XX_GPU_GMU_CX_GMU_RPMH_POWER_STATE),
+			adreno_gpu->funcs->gx_is_on(adreno_gpu) ? "on" : "off",
+			a8xx ? gmu_read(gmu, REG_A8XX_GMU_PWR_CLK_STATUS) : 0,
+			gmu_read(gmu, REG_A6XX_GPU_GMU_AO_GPU_CX_BUSY_STATUS),
 			adreno_gpu->base.needs_hw_init ? "pending" : "done");
 		goto force_off;
 	}

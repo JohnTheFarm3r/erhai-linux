@@ -30,6 +30,10 @@ struct erhai_buck_sample {
 struct erhai_buck {
 	enum erhai_buck_phase phase;
 	bool ffc_used, disable, recharged, over_voltage;
+	/* The firmware keeps its own float voltage (no pack gauge, outside
+	 * FFC): the checks that act on the AP's (hw full, FV over) are off.
+	 */
+	bool fv_firmware;
 	unsigned int step, voltage_count, current_count;
 	unsigned int sw_count, hw_count, recharge_count, over_count;
 	int temp_region, ffc_region, temp_boundary, temp_offset;
@@ -230,7 +234,7 @@ static inline void erhai_buck_update(struct erhai_buck *b,
 	if (b->disable)
 		goto limits;
 	hw_mv = b->normal_fv_mv + 18;
-	b->hw_count = s->mv > hw_mv ? b->hw_count + 1 : 0;
+	b->hw_count = !b->fv_firmware && s->mv > hw_mv ? b->hw_count + 1 : 0;
 	if (s->mv > b->cutoff_mv && s->ma <= b->cutoff_ma)
 		b->sw_count++;
 	else
@@ -241,7 +245,7 @@ static inline void erhai_buck_update(struct erhai_buck *b,
 	}
 	/* check_fv_over: VFLOAT_OVER_NUM=2, reduce by sw-over-fv-dec-mv. */
 	over_mv = s->qualified ? b->normal_fv_mv + 10 : 3990;
-	b->over_count = s->mv > over_mv ? b->over_count + 1 : 0;
+	b->over_count = !b->fv_firmware && s->mv > over_mv ? b->over_count + 1 : 0;
 	if (b->over_count > 2 && b->phase != ERHAI_BUCK_FULL) {
 		b->fv_decrement += 8;
 		b->over_count = 0;
